@@ -79,25 +79,3 @@ Il prezzo è {direction} significativamente!
 
 # Global instance
 crypto_monitor = CryptoMonitor()
-```
-
-5. **Commit message**: "Add crypto price monitor module"
-6. **Clicca**: **"Commit new file"**
-
-## 📝 PASSO 2 - AGGIORNA `main.py`:
-
-1. **Clicca** su `main.py`
-2. **Clicca** l'icona matita ✏️
-3. **Seleziona tutto** (Ctrl+A) e **cancella**
-4. **Apri** il file `C:\Users\giona\Desktop\main_with_monitor.py`
-5. **Copia tutto** il contenuto e **incolla** su GitHub
-6. **Commit message**: "Add real-time price monitoring"
-7. **Clicca**: **"Commit changes"**
-
-## 📝 PASSO 3 - AGGIORNA `requirements.txt`:
-
-1. **Clicca** su `requirements.txt`
-2. **Clicca** matita ✏️
-3. **Aggiungi** questa riga alla fine:
-```
-   aiofiles==23.2.1
