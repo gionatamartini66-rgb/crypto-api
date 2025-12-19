@@ -4,12 +4,18 @@ from datetime import datetime
 import os
 import json
 import requests
+import asyncio
 from typing import List, Dict, Optional
+
+# Import crypto monitor
+import sys
+sys.path.append('.')
+from crypto_monitor import crypto_monitor
 
 app = FastAPI(
     title="Crypto Gem Finder API",
     description="Real-time cryptocurrency analysis with Telegram alerts",
-    version="2.4"
+    version="2.5"
 )
 
 # CORS
@@ -24,6 +30,7 @@ app.add_middleware(
 # In-memory storage
 signals_storage = []
 test_signal_id = 0
+monitoring_active = False
 
 # Telegram configuration
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -49,6 +56,51 @@ def send_telegram_message(message: str):
         print(f"Telegram error: {e}")
         return False
 
+# Background task for price monitoring
+async def monitor_prices_task():
+    """Monitor crypto prices every 5 minutes"""
+    global monitoring_active
+    while monitoring_active:
+        try:
+            # Get current prices
+            prices = crypto_monitor.get_prices()
+            if prices:
+                # Check for alerts
+                alerts = crypto_monitor.check_price_changes(prices)
+                
+                # Send alerts to Telegram
+                for alert in alerts:
+                    message = crypto_monitor.format_alert_message(alert)
+                    send_telegram_message(message)
+                    
+                    # Store signal
+                    signals_storage.append({
+                        "type": "price_alert",
+                        "data": alert,
+                        "created_at": datetime.utcnow().isoformat()
+                    })
+            
+            # Wait 5 minutes
+            await asyncio.sleep(300)
+            
+        except Exception as e:
+            print(f"Monitor error: {e}")
+            await asyncio.sleep(60)  # Wait 1 minute on error
+
+# Startup event
+@app.on_event("startup")
+async def startup_event():
+    global monitoring_active
+    monitoring_active = True
+    # Start background monitoring
+    asyncio.create_task(monitor_prices_task())
+
+# Shutdown event
+@app.on_event("shutdown")
+async def shutdown_event():
+    global monitoring_active
+    monitoring_active = False
+
 # Root endpoint
 @app.get("/")
 async def root():
@@ -57,19 +109,69 @@ async def root():
         telegram_status = "configured"
     
     return {
-        "message": "Crypto Gem Finder API v2.4",
+        "message": "Crypto Gem Finder API v2.5",
         "status": "online",
         "database": "in-memory",
         "telegram": telegram_status,
+        "monitoring": "active" if monitoring_active else "inactive",
         "endpoints": {
             "docs": "/docs",
             "health": "/health",
             "signals": "/api/v1/signals",
-            "test_signal": "/api/v1/test-signal",
-            "telegram_test": "/api/v1/telegram-test"
+            "prices": "/api/v1/prices",
+            "monitoring": "/api/v1/monitoring"
         },
         "timestamp": datetime.utcnow().isoformat()
     }
+
+# Get current prices
+@app.get("/api/v1/prices")
+async def get_current_prices():
+    """Get current crypto prices"""
+    prices = crypto_monitor.get_prices()
+    return {
+        "prices": prices,
+        "tracked_coins": crypto_monitor.tracked_coins,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+# Get/Set monitoring status
+@app.get("/api/v1/monitoring")
+async def get_monitoring_status():
+    """Get monitoring status"""
+    return {
+        "active": monitoring_active,
+        "tracked_coins": crypto_monitor.tracked_coins,
+        "thresholds": crypto_monitor.alert_thresholds,
+        "last_prices": crypto_monitor.last_prices
+    }
+
+@app.post("/api/v1/monitoring/{action}")
+async def control_monitoring(action: str):
+    """Start or stop monitoring"""
+    global monitoring_active
+    
+    if action == "start":
+        monitoring_active = True
+        asyncio.create_task(monitor_prices_task())
+        
+        if TELEGRAM_BOT_TOKEN:
+            send_telegram_message("🟢 Monitoraggio prezzi ATTIVATO\n\nRiceverai alert per variazioni significative.")
+        
+        return {"status": "started", "monitoring": monitoring_active}
+    
+    elif action == "stop":
+        monitoring_active = False
+        
+        if TELEGRAM_BOT_TOKEN:
+            send_telegram_message("🔴 Monitoraggio prezzi DISATTIVATO")
+            
+        return {"status": "stopped", "monitoring": monitoring_active}
+    
+    else:
+        raise HTTPException(status_code=400, detail="Action must be 'start' or 'stop'")
+
+# ADD ALL OTHER EXISTING ENDPOINTS BELOW (health, signals, telegram-test, etc.)
 
 # Health check
 @app.get("/health")
@@ -78,6 +180,7 @@ async def health_check():
         "status": "healthy",
         "database": "in-memory",
         "telegram_configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
+        "monitoring_active": monitoring_active,
         "timestamp": datetime.utcnow().isoformat()
     }
 
@@ -105,7 +208,7 @@ async def get_signals(limit: int = 10):
         "total_signals": len(signals_storage)
     }
 
-# Create test signal with Telegram notification
+# Create test signal
 @app.post("/api/v1/test-signal")
 async def create_test_signal(background_tasks: BackgroundTasks):
     global test_signal_id
@@ -147,51 +250,4 @@ async def create_test_signal(background_tasks: BackgroundTasks):
         "signal_id": test_signal_id,
         "message": "Test signal created!",
         "telegram_sent": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
-    }
-
-# Crypto price alert example
-@app.post("/api/v1/alerts/price")
-async def create_price_alert(
-    symbol: str, 
-    target_price: float, 
-    alert_type: str,
-    background_tasks: BackgroundTasks
-):
-    """Create a price alert (example endpoint)"""
-    alert = {
-        "symbol": symbol.upper(),
-        "target_price": target_price,
-        "type": alert_type,  # "above" or "below"
-        "created_at": datetime.utcnow().isoformat()
-    }
-    
-    # Send Telegram notification
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        emoji = "📈" if alert_type == "above" else "📉"
-        message = f"""
-{emoji} <b>PRICE ALERT IMPOSTATO</b>
-
-🪙 <b>Coin:</b> {symbol.upper()}
-🎯 <b>Target:</b> ${target_price:,.2f}
-📊 <b>Tipo:</b> Avvisa quando il prezzo è {alert_type} il target
-
-Riceverai una notifica quando si verifica questa condizione!
-"""
-        background_tasks.add_task(send_telegram_message, message)
-    
-    return {
-        "success": True,
-        "alert": alert,
-        "telegram_notification": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
-    }
-
-# Get crypto data (mock)
-@app.get("/api/v1/cryptos")
-async def get_cryptos():
-    return {
-        "cryptos": [
-            {"id": "bitcoin", "symbol": "BTC", "name": "Bitcoin", "price": 42000.50, "change_24h": 2.5},
-            {"id": "ethereum", "symbol": "ETH", "name": "Ethereum", "price": 2200.30, "change_24h": 3.2}
-        ],
-        "timestamp": datetime.utcnow().isoformat()
     }
