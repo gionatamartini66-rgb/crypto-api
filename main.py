@@ -1,21 +1,40 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime
+"""
+Crypto Gem Finder - Main Application
+Sistema di monitoraggio cryptocurrency con alert intelligenti
+"""
 import os
-import json
-import requests
+import time
 import asyncio
-from typing import List, Dict, Optional
+import logging
+from typing import Dict, List, Optional
+from datetime import datetime
 
-# Import crypto monitor
-import sys
-sys.path.append('.')
-from crypto_monitor import crypto_monitor
+import requests
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 
+# Import custom modules
+from alert_optimizer import (
+    AlertOptimizer, 
+    AlertType, 
+    AlertPriority, 
+    MessageTemplate,
+    alert_optimizer
+)
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# FastAPI app
 app = FastAPI(
-    title="Crypto Gem Finder API",
-    description="Real-time cryptocurrency analysis with Telegram alerts",
-    version="2.5"
+    title="Crypto Gem Finder",
+    description="Sistema intelligente monitoraggio cryptocurrency",
+    version="2.0.0"
 )
 
 # CORS
@@ -27,227 +46,390 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory storage
-signals_storage = []
-test_signal_id = 0
+# Configuration
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY", "")
+
+# Monitoring state
 monitoring_active = False
+monitoring_task: Optional[asyncio.Task] = None
 
-# Telegram configuration
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+# In-memory storage (da migrare a PostgreSQL)
+price_cache: Dict[str, Dict] = {}
+alert_history: List[Dict] = []
 
-def send_telegram_message(message: str):
-    """Send message to Telegram"""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram not configured")
-        return False
+# CoinGecko configuration
+COINGECKO_BASE_URL = "https://api.coingecko.com/api/v3"
+TRACKED_COINS = ["bitcoin", "ethereum", "binancecoin", "cardano", "solana"]
+
+
+class TelegramBot:
+    """Client Telegram Bot semplificato"""
     
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    data = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML"
+    def __init__(self, token: str, chat_id: str):
+        self.token = token
+        self.chat_id = chat_id
+        self.base_url = f"https://api.telegram.org/bot{token}"
+    
+    def send_message(self, text: str) -> bool:
+        """Invia messaggio Telegram"""
+        if not self.token or not self.chat_id:
+            logger.warning("Telegram non configurato")
+            return False
+        
+        try:
+            url = f"{self.base_url}/sendMessage"
+            data = {
+                "chat_id": self.chat_id,
+                "text": text,
+                "parse_mode": "HTML"
+            }
+            
+            response = requests.post(url, json=data, timeout=10)
+            
+            if response.status_code == 200:
+                logger.info("✅ Messaggio Telegram inviato")
+                return True
+            else:
+                logger.error(f"❌ Telegram error: {response.status_code}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ Errore invio Telegram: {e}")
+            return False
+
+
+# Initialize Telegram bot
+telegram_bot = TelegramBot(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+
+
+def get_coingecko_headers() -> Dict[str, str]:
+    """Headers per richieste CoinGecko"""
+    headers = {"accept": "application/json"}
+    if COINGECKO_API_KEY:
+        headers["x-cg-pro-api-key"] = COINGECKO_API_KEY
+    return headers
+
+
+async def fetch_coin_data(coin_id: str) -> Optional[Dict]:
+    """Recupera dati coin da CoinGecko"""
+    try:
+        url = f"{COINGECKO_BASE_URL}/coins/{coin_id}"
+        params = {
+            "localization": "false",
+            "tickers": "false",
+            "community_data": "true",
+            "developer_data": "false",
+            "sparkline": "false"
+        }
+        
+        response = requests.get(
+            url, 
+            params=params,
+            headers=get_coingecko_headers(),
+            timeout=10
+        )
+        
+        if response.status_code != 200:
+            logger.error(f"CoinGecko error {response.status_code} per {coin_id}")
+            return None
+        
+        data = response.json()
+        
+        # Estrai dati rilevanti
+        market_data = data.get('market_data', {})
+        
+        return {
+            'id': coin_id,
+            'symbol': data.get('symbol', '').upper(),
+            'name': data.get('name', ''),
+            'price': market_data.get('current_price', {}).get('usd', 0),
+            'change24h': market_data.get('price_change_percentage_24h', 0),
+            'volume24h': market_data.get('total_volume', {}).get('usd', 0),
+            'marketCap': market_data.get('market_cap', {}).get('usd', 0),
+            'high24h': market_data.get('high_24h', {}).get('usd', 0),
+            'low24h': market_data.get('low_24h', {}).get('usd', 0),
+        }
+        
+    except Exception as e:
+        logger.error(f"Errore fetch {coin_id}: {e}")
+        return None
+
+
+def analyze_crypto(coin_data: Dict) -> tuple[AlertType, AlertPriority, bool]:
+    """
+    Analizza crypto e determina se inviare alert
+    
+    Returns:
+        (alert_type, priority, should_alert)
+    """
+    change_24h = coin_data.get('change24h', 0)
+    volume = coin_data.get('volume24h', 0)
+    market_cap = coin_data.get('marketCap', 0)
+    
+    # PUMP Detection (>50% in 24h)
+    if change_24h > 50:
+        priority = alert_optimizer.get_priority(AlertType.PUMP, coin_data)
+        return AlertType.PUMP, priority, True
+    
+    # VOLUME SPIKE Detection (sopra media)
+    if volume > market_cap * 0.5:  # Volume > 50% market cap
+        priority = alert_optimizer.get_priority(AlertType.VOLUME_SPIKE, coin_data)
+        return AlertType.VOLUME_SPIKE, priority, True
+    
+    # PRICE DROP Detection (<-20% in 24h)
+    if change_24h < -20:
+        priority = alert_optimizer.get_priority(AlertType.PRICE_DROP, coin_data)
+        return AlertType.PRICE_DROP, priority, True
+    
+    # STRONG BUY (variazione positiva + volume alto)
+    if change_24h > 10 and volume > 100_000_000:
+        priority = alert_optimizer.get_priority(AlertType.STRONG_BUY, coin_data)
+        return AlertType.STRONG_BUY, priority, True
+    
+    return AlertType.STRONG_BUY, AlertPriority.LOW, False
+
+
+async def check_and_alert(coin_id: str):
+    """Controlla coin e invia alert se necessario"""
+    
+    # Fetch dati
+    coin_data = await fetch_coin_data(coin_id)
+    if not coin_data:
+        return
+    
+    # Salva in cache
+    price_cache[coin_id] = {
+        **coin_data,
+        'timestamp': time.time()
     }
     
-    try:
-        response = requests.post(url, json=data, timeout=10)
-        return response.json().get("ok", False)
-    except Exception as e:
-        print(f"Telegram error: {e}")
-        return False
+    # Analizza
+    alert_type, priority, should_check = analyze_crypto(coin_data)
+    
+    if not should_check:
+        return
+    
+    # Verifica con optimizer
+    should_send, reason = alert_optimizer.should_send_alert(
+        coin_id=coin_id,
+        alert_type=alert_type,
+        crypto_data=coin_data,
+        priority=priority
+    )
+    
+    if not should_send:
+        logger.debug(f"Alert bloccato per {coin_id}: {reason}")
+        return
+    
+    # Prepara e invia messaggio
+    message = MessageTemplate.format_alert(alert_type, priority, coin_data)
+    
+    if telegram_bot.send_message(message):
+        # Registra alert inviato
+        alert_optimizer.record_alert(
+            coin_id=coin_id,
+            alert_type=alert_type,
+            price=coin_data['price'],
+            priority=priority
+        )
+        
+        # Salva in history
+        alert_history.append({
+            'coin_id': coin_id,
+            'alert_type': alert_type.value,
+            'priority': priority.value,
+            'price': coin_data['price'],
+            'timestamp': datetime.now().isoformat()
+        })
+        
+        logger.info(f"✅ Alert inviato: {coin_id} - {alert_type.value}")
 
-# Background task for price monitoring
-async def monitor_prices_task():
-    """Monitor crypto prices every 5 minutes"""
-    global monitoring_active
+
+async def monitoring_loop():
+    """Loop principale monitoring"""
+    logger.info("🚀 Monitoring loop avviato")
+    
+    check_interval = 300  # 5 minuti
+    cleanup_interval = 3600  # 1 ora
+    last_cleanup = time.time()
+    
     while monitoring_active:
         try:
-            # Get current prices
-            prices = crypto_monitor.get_prices()
-            if prices:
-                # Check for alerts
-                alerts = crypto_monitor.check_price_changes(prices)
-                
-                # Send alerts to Telegram
-                for alert in alerts:
-                    message = crypto_monitor.format_alert_message(alert)
-                    send_telegram_message(message)
-                    
-                    # Store signal
-                    signals_storage.append({
-                        "type": "price_alert",
-                        "data": alert,
-                        "created_at": datetime.utcnow().isoformat()
-                    })
+            logger.info("🔍 Scanning crypto...")
             
-            # Wait 5 minutes
-            await asyncio.sleep(300)
+            # Check ogni coin
+            for coin_id in TRACKED_COINS:
+                await check_and_alert(coin_id)
+                await asyncio.sleep(2)  # Rate limiting CoinGecko
+            
+            # Cleanup periodico
+            if time.time() - last_cleanup > cleanup_interval:
+                alert_optimizer.cleanup_old_alerts()
+                last_cleanup = time.time()
+                logger.info("🧹 Cleanup completato")
+            
+            # Stats
+            stats = alert_optimizer.get_stats()
+            logger.info(f"📊 Stats: {stats['alerts_sent']} sent, "
+                       f"{stats['alerts_blocked_cooldown']} cooldown, "
+                       f"{stats['alerts_blocked_filters']} filtered")
+            
+            # Attendi prossimo check
+            await asyncio.sleep(check_interval)
             
         except Exception as e:
-            print(f"Monitor error: {e}")
-            await asyncio.sleep(60)  # Wait 1 minute on error
-
-# Startup event
-@app.on_event("startup")
-async def startup_event():
-    global monitoring_active
-    monitoring_active = True
-    # Start background monitoring
-    asyncio.create_task(monitor_prices_task())
-
-# Shutdown event
-@app.on_event("shutdown")
-async def shutdown_event():
-    global monitoring_active
-    monitoring_active = False
-
-# Root endpoint
-@app.get("/")
-async def root():
-    telegram_status = "not configured"
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        telegram_status = "configured"
+            logger.error(f"❌ Errore monitoring: {e}")
+            await asyncio.sleep(30)
     
-    return {
-        "message": "Crypto Gem Finder API v2.5",
-        "status": "online",
-        "database": "in-memory",
-        "telegram": telegram_status,
-        "monitoring": "active" if monitoring_active else "inactive",
-        "endpoints": {
-            "docs": "/docs",
-            "health": "/health",
-            "signals": "/api/v1/signals",
-            "prices": "/api/v1/prices",
-            "monitoring": "/api/v1/monitoring"
-        },
-        "timestamp": datetime.utcnow().isoformat()
-    }
+    logger.info("⏸️ Monitoring loop fermato")
 
-# Get current prices
-@app.get("/api/v1/prices")
-async def get_current_prices():
-    """Get current crypto prices"""
-    prices = crypto_monitor.get_prices()
-    return {
-        "prices": prices,
-        "tracked_coins": crypto_monitor.tracked_coins,
-        "timestamp": datetime.utcnow().isoformat()
-    }
 
-# Get/Set monitoring status
-@app.get("/api/v1/monitoring")
-async def get_monitoring_status():
-    """Get monitoring status"""
-    return {
-        "active": monitoring_active,
-        "tracked_coins": crypto_monitor.tracked_coins,
-        "thresholds": crypto_monitor.alert_thresholds,
-        "last_prices": crypto_monitor.last_prices
-    }
+# ============================================================================
+# API ENDPOINTS
+# ============================================================================
 
-@app.post("/api/v1/monitoring/{action}")
-async def control_monitoring(action: str):
-    """Start or stop monitoring"""
-    global monitoring_active
-    
-    if action == "start":
-        monitoring_active = True
-        asyncio.create_task(monitor_prices_task())
-        
-        if TELEGRAM_BOT_TOKEN:
-            send_telegram_message("🟢 Monitoraggio prezzi ATTIVATO\n\nRiceverai alert per variazioni significative.")
-        
-        return {"status": "started", "monitoring": monitoring_active}
-    
-    elif action == "stop":
-        monitoring_active = False
-        
-        if TELEGRAM_BOT_TOKEN:
-            send_telegram_message("🔴 Monitoraggio prezzi DISATTIVATO")
-            
-        return {"status": "stopped", "monitoring": monitoring_active}
-    
-    else:
-        raise HTTPException(status_code=400, detail="Action must be 'start' or 'stop'")
-
-# ADD ALL OTHER EXISTING ENDPOINTS BELOW (health, signals, telegram-test, etc.)
-
-# Health check
-@app.get("/health")
+@app.get("/api/health")
 async def health_check():
+    """Health check endpoint"""
     return {
         "status": "healthy",
-        "database": "in-memory",
-        "telegram_configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
         "monitoring_active": monitoring_active,
-        "timestamp": datetime.utcnow().isoformat()
+        "telegram_configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
+        "tracked_coins": len(TRACKED_COINS),
+        "cache_size": len(price_cache),
+        "alert_history_size": len(alert_history),
+        "optimizer_stats": alert_optimizer.get_stats()
     }
 
-# Test Telegram
-@app.post("/api/v1/telegram-test")
+
+@app.get("/api/prices")
+async def get_prices():
+    """Ottieni prezzi attuali delle crypto monitorate"""
+    return {
+        "prices": price_cache,
+        "count": len(price_cache),
+        "timestamp": datetime.now().isoformat()
+    }
+
+
+@app.get("/api/alerts/history")
+async def get_alert_history(limit: int = 50):
+    """Storico alert inviati"""
+    return {
+        "alerts": alert_history[-limit:],
+        "total": len(alert_history)
+    }
+
+
+@app.get("/api/alerts/stats")
+async def get_alert_stats():
+    """Statistiche sistema alert"""
+    return alert_optimizer.get_stats()
+
+
+@app.post("/api/test-telegram")
 async def test_telegram():
-    """Test Telegram integration"""
+    """Test invio messaggio Telegram"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        raise HTTPException(status_code=503, detail="Telegram not configured")
+        raise HTTPException(status_code=400, detail="Telegram non configurato")
     
-    message = "🔔 <b>Test Alert</b>\n\n✅ Telegram integration working!\n\nCrypto Gem Finder is ready to send alerts."
-    success = send_telegram_message(message)
+    message = (
+        "🧪 <b>Test Crypto Gem Finder</b>\n\n"
+        "✅ Bot Telegram operativo\n"
+        "🔔 Sistema alert attivo\n"
+        f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    
+    success = telegram_bot.send_message(message)
     
     if success:
-        return {"success": True, "message": "Telegram test message sent!"}
+        return {"status": "success", "message": "Test inviato"}
     else:
-        raise HTTPException(status_code=500, detail="Failed to send Telegram message")
+        raise HTTPException(status_code=500, detail="Errore invio messaggio")
 
-# Get signals
-@app.get("/api/v1/signals")
-async def get_signals(limit: int = 10):
-    return {
-        "signals": signals_storage[-limit:] if signals_storage else [],
-        "count": len(signals_storage[-limit:]) if signals_storage else 0,
-        "total_signals": len(signals_storage)
-    }
 
-# Create test signal
-@app.post("/api/v1/test-signal")
-async def create_test_signal(background_tasks: BackgroundTasks):
-    global test_signal_id
-    test_signal_id += 1
+@app.post("/api/start-monitoring")
+async def start_monitoring():
+    """Avvia monitoring crypto"""
+    global monitoring_active, monitoring_task
     
-    signal = {
-        "id": test_signal_id,
-        "coin_id": "bitcoin",
-        "symbol": "BTC",
-        "signal_type": "TEST_SIGNAL",
-        "strength": 0.85,
-        "price": 42000.0,
-        "message": f"Test signal #{test_signal_id} - Sistema funzionante!",
-        "created_at": datetime.utcnow().isoformat()
-    }
+    if monitoring_active:
+        return {"status": "already_running", "message": "Monitoring già attivo"}
     
-    signals_storage.append(signal)
+    monitoring_active = True
+    monitoring_task = asyncio.create_task(monitoring_loop())
     
-    # Keep only last 100 signals
-    if len(signals_storage) > 100:
-        signals_storage.pop(0)
-    
-    # Send Telegram notification
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        telegram_message = f"""
-🚨 <b>NUOVO SEGNALE CRYPTO</b>
-
-💰 <b>Coin:</b> {signal['symbol']}
-📊 <b>Tipo:</b> {signal['signal_type']}
-💪 <b>Forza:</b> {signal['strength'] * 100:.0f}%
-💵 <b>Prezzo:</b> ${signal['price']:,.2f}
-📝 <b>Messaggio:</b> {signal['message']}
-⏰ <b>Ora:</b> {datetime.utcnow().strftime('%H:%M:%S')}
-"""
-        background_tasks.add_task(send_telegram_message, telegram_message)
+    logger.info("▶️ Monitoring avviato")
     
     return {
-        "success": True,
-        "signal_id": test_signal_id,
-        "message": "Test signal created!",
-        "telegram_sent": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+        "status": "started",
+        "message": "Monitoring avviato con successo",
+        "tracked_coins": TRACKED_COINS
     }
+
+
+@app.post("/api/stop-monitoring")
+async def stop_monitoring():
+    """Ferma monitoring crypto"""
+    global monitoring_active, monitoring_task
+    
+    if not monitoring_active:
+        return {"status": "not_running", "message": "Monitoring non attivo"}
+    
+    monitoring_active = False
+    
+    if monitoring_task:
+        monitoring_task.cancel()
+        try:
+            await monitoring_task
+        except asyncio.CancelledError:
+            pass
+    
+    logger.info("⏸️ Monitoring fermato")
+    
+    return {"status": "stopped", "message": "Monitoring fermato"}
+
+
+@app.post("/api/alerts/reset-stats")
+async def reset_alert_stats():
+    """Reset statistiche alert"""
+    alert_optimizer.reset_stats()
+    return {"status": "success", "message": "Statistiche resettate"}
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Evento startup applicazione"""
+    logger.info("=" * 60)
+    logger.info("🚀 CRYPTO GEM FINDER v2.0 - AVVIO")
+    logger.info("=" * 60)
+    logger.info(f"Telegram configurato: {bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)}")
+    logger.info(f"CoinGecko API key: {bool(COINGECKO_API_KEY)}")
+    logger.info(f"Crypto monitorate: {len(TRACKED_COINS)}")
+    logger.info("=" * 60)
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Evento shutdown applicazione"""
+    global monitoring_active, monitoring_task
+    
+    if monitoring_active:
+        monitoring_active = False
+        if monitoring_task:
+            monitoring_task.cancel()
+    
+    logger.info("👋 Crypto Gem Finder shutdown")
+
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 8000))
+    
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=port,
+        reload=False,
+        log_level="info"
