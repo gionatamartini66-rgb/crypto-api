@@ -6,7 +6,7 @@ import os
 import time
 import asyncio
 import logging
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
 from datetime import datetime
 from dataclasses import dataclass
 from enum import Enum
@@ -79,14 +79,11 @@ class AlertOptimizer:
             "alerts_blocked_rate_limit": 0
         }
     
-    def should_send_alert(
-        self,
-        coin_id: str,
-        alert_type: AlertType,
-        crypto_data: Dict,
-        priority: AlertPriority = AlertPriority.MEDIUM
-    ) -> Tuple[bool, Optional[str]]:
+    def should_send_alert(self, coin_id: str, alert_type: AlertType, crypto_data: Dict, priority: AlertPriority = None):
         """Determina se un alert deve essere inviato"""
+        if priority is None:
+            priority = AlertPriority.MEDIUM
+            
         self.stats["total_checks"] += 1
         
         if not self._check_rate_limit():
@@ -127,7 +124,7 @@ class AlertOptimizer:
         self.stats["alerts_sent"] += 1
         self._track_rate_limit()
     
-    def _check_rate_limit(self) -> bool:
+    def _check_rate_limit(self):
         """Verifica rate limiting"""
         now = time.time()
         self.alerts_sent_minute = [t for t in self.alerts_sent_minute if now - t < 60]
@@ -137,7 +134,7 @@ class AlertOptimizer:
         """Traccia alert per rate limiting"""
         self.alerts_sent_minute.append(time.time())
     
-    def _check_filters(self, crypto_data: Dict) -> Tuple[bool, Optional[str]]:
+    def _check_filters(self, crypto_data: Dict):
         """Applica filtri qualità"""
         volume = crypto_data.get('volume24h', 0)
         if volume < self.min_volume_24h:
@@ -153,7 +150,7 @@ class AlertOptimizer:
         
         return True, None
     
-    def get_priority(self, alert_type: AlertType, crypto_data: Dict) -> AlertPriority:
+    def get_priority(self, alert_type: AlertType, crypto_data: Dict):
         """Determina priorità alert"""
         change_24h = abs(crypto_data.get('change24h', 0))
         market_cap = crypto_data.get('marketCap', 0)
@@ -186,7 +183,7 @@ class AlertOptimizer:
             if v.timestamp > cutoff_time
         }
     
-    def get_stats(self) -> Dict:
+    def get_stats(self):
         """Statistiche sistema"""
         return {
             **self.stats,
@@ -212,7 +209,7 @@ class MessageTemplate:
     """Template messaggi Telegram"""
     
     @staticmethod
-    def format_alert(alert_type: AlertType, priority: AlertPriority, crypto_data: Dict) -> str:
+    def format_alert(alert_type: AlertType, priority: AlertPriority, crypto_data: Dict):
         """Formatta messaggio alert"""
         name = crypto_data['name']
         symbol = crypto_data['symbol']
@@ -309,7 +306,7 @@ class TelegramBot:
         self.chat_id = chat_id
         self.base_url = f"https://api.telegram.org/bot{token}"
     
-    def send_message(self, text: str) -> bool:
+    def send_message(self, text: str):
         """Invia messaggio Telegram"""
         if not self.token or not self.chat_id:
             logger.warning("Telegram non configurato")
@@ -334,7 +331,7 @@ class TelegramBot:
 telegram_bot = TelegramBot(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 
 
-def get_coingecko_headers() -> Dict[str, str]:
+def get_coingecko_headers():
     """Headers CoinGecko"""
     headers = {"accept": "application/json"}
     if COINGECKO_API_KEY:
@@ -342,7 +339,7 @@ def get_coingecko_headers() -> Dict[str, str]:
     return headers
 
 
-async def fetch_coin_data(coin_id: str) -> Optional[Dict]:
+async def fetch_coin_data(coin_id: str):
     """Recupera dati coin"""
     try:
         url = f"{COINGECKO_BASE_URL}/coins/{coin_id}"
@@ -379,7 +376,7 @@ async def fetch_coin_data(coin_id: str) -> Optional[Dict]:
         return None
 
 
-def analyze_crypto(coin_data: Dict) -> Tuple[AlertType, AlertPriority, bool]:
+def analyze_crypto(coin_data: Dict):
     """Analizza crypto"""
     change_24h = coin_data.get('change24h', 0)
     volume = coin_data.get('volume24h', 0)
