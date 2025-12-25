@@ -1,6 +1,6 @@
 """
-Crypto Gem Finder - Main Application v2.0.1
-Sistema completo con Alert Optimizer + AUTO-START
+Crypto Gem Finder - Main Application v2.1
+Sistema completo con Alert Optimizer + Database PostgreSQL
 """
 import os
 import time
@@ -12,9 +12,10 @@ from dataclasses import dataclass
 from enum import Enum
 
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
+import asyncpg
 
 # Setup logging
 logging.basicConfig(
@@ -22,6 +23,226 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# DATABASE MANAGER
+# ============================================================================
+
+class DatabaseManager:
+    """Gestione PostgreSQL con graceful fallback"""
+    
+    def __init__(self):
+        self.pool: Optional[asyncpg.Pool] = None
+        self.database_url = os.getenv("DATABASE_URL", "")
+        self.enabled = bool(self.database_url)
+        self.connected = False
+        
+    async def connect(self):
+        """Connessione PostgreSQL"""
+        if not self.enabled:
+            logger.warning("⚠️ Database non configurato - usando in-memory storage")
+            return False
+        
+        try:
+            self.pool = await asyncpg.create_pool(
+                self.database_url,
+                min_size=2,
+                max_size=10,
+                command_timeout=60
+            )
+            
+            async with self.pool.acquire() as conn:
+                await conn.fetchval('SELECT 1')
+            
+            self.connected = True
+            logger.info("✅ Database PostgreSQL connesso")
+            
+            # Auto-create tables
+            await self._create_tables()
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Database connection failed: {e}")
+            self.enabled = False
+            self.connected = False
+            return False
+    
+    async def _create_tables(self):
+        """Crea tabelle automaticamente se non esistono"""
+        if not self.pool:
+            return
+        
+        try:
+            async with self.pool.acquire() as conn:
+                # Prices history
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS prices_history (
+                        id SERIAL PRIMARY KEY,
+                        coin_id VARCHAR(50) NOT NULL,
+                        symbol VARCHAR(10) NOT NULL,
+                        name VARCHAR(100) NOT NULL,
+                        price DECIMAL(20,8) NOT NULL,
+                        change_24h DECIMAL(10,4),
+                        volume_24h BIGINT,
+                        market_cap BIGINT,
+                        high_24h DECIMAL(20,8),
+                        low_24h DECIMAL(20,8),
+                        timestamp TIMESTAMP DEFAULT NOW(),
+                        created_at TIMESTAMP DEFAULT NOW()
+                    )
+                """)
+                
+                # Alerts history
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS alerts_history (
+                        id SERIAL PRIMARY KEY,
+                        coin_id VARCHAR(50) NOT NULL,
+                        alert_type VARCHAR(20) NOT NULL,
+                        priority VARCHAR(10) NOT NULL,
+                        price DECIMAL(20,8),
+                        change_percent DECIMAL(10,4),
+                        volume_24h BIGINT,
+                        market_cap BIGINT,
+                        message TEXT,
+                        sent_at TIMESTAMP DEFAULT NOW(),
+                        created_at TIMESTAMP DEFAULT NOW()
+                    )
+                """)
+                
+                # Indexes
+                await conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_prices_coin_timestamp 
+                    ON prices_history(coin_id, timestamp DESC)
+                """)
+                
+                await conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_alerts_sent 
+                    ON alerts_history(sent_at DESC)
+                """)
+                
+                logger.info("✅ Database schema verificato/creato")
+                
+        except Exception as e:
+            logger.error(f"Error creating tables: {e}")
+    
+    async def disconnect(self):
+        if self.pool:
+            await self.pool.close()
+            logger.info("Database disconnesso")
+    
+    async def save_price(self, coin_data: Dict):
+        """Salva prezzo su database"""
+        if not self.connected or not self.pool:
+            return
+        
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO prices_history 
+                    (coin_id, symbol, name, price, change_24h, volume_24h, market_cap, high_24h, low_24h)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    """,
+                    coin_data['id'],
+                    coin_data['symbol'],
+                    coin_data['name'],
+                    float(coin_data['price']),
+                    float(coin_data.get('change24h', 0)),
+                    int(coin_data.get('volume24h', 0)),
+                    int(coin_data.get('marketCap', 0)),
+                    float(coin_data.get('high24h', 0)),
+                    float(coin_data.get('low24h', 0))
+                )
+        except Exception as e:
+            logger.error(f"Error save_price: {e}")
+    
+    async def save_alert(self, alert_data: Dict):
+        """Salva alert su database"""
+        if not self.connected or not self.pool:
+            return
+        
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO alerts_history 
+                    (coin_id, alert_type, priority, price, change_percent, volume_24h, market_cap, message)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    """,
+                    alert_data['coin_id'],
+                    alert_data['alert_type'],
+                    alert_data['priority'],
+                    float(alert_data.get('price', 0)),
+                    float(alert_data.get('change_percent', 0)),
+                    int(alert_data.get('volume_24h', 0)),
+                    int(alert_data.get('market_cap', 0)),
+                    alert_data.get('message', '')
+                )
+        except Exception as e:
+            logger.error(f"Error save_alert: {e}")
+    
+    async def get_price_history(self, coin_id: str, days: int = 7):
+        """Recupera storico prezzi"""
+        if not self.connected or not self.pool:
+            return []
+        
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT coin_id, symbol, name, price, change_24h, 
+                           volume_24h, market_cap, timestamp
+                    FROM prices_history
+                    WHERE coin_id = $1 
+                      AND timestamp > NOW() - INTERVAL '1 day' * $2
+                    ORDER BY timestamp DESC
+                    LIMIT 1000
+                    """,
+                    coin_id, days
+                )
+            
+            return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error get_price_history: {e}")
+            return []
+    
+    async def get_alert_history(self, limit: int = 50, coin_id: Optional[str] = None):
+        """Recupera storico alert"""
+        if not self.connected or not self.pool:
+            return []
+        
+        try:
+            async with self.pool.acquire() as conn:
+                if coin_id:
+                    rows = await conn.fetch(
+                        """
+                        SELECT id, coin_id, alert_type, priority, price, 
+                               change_percent, message, sent_at
+                        FROM alerts_history
+                        WHERE coin_id = $1
+                        ORDER BY sent_at DESC
+                        LIMIT $2
+                        """,
+                        coin_id, limit
+                    )
+                else:
+                    rows = await conn.fetch(
+                        """
+                        SELECT id, coin_id, alert_type, priority, price,
+                               change_percent, message, sent_at
+                        FROM alerts_history
+                        ORDER BY sent_at DESC
+                        LIMIT $1
+                        """,
+                        limit
+                    )
+            
+            return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error get_alert_history: {e}")
+            return []
 
 
 # ============================================================================
@@ -259,8 +480,8 @@ class MessageTemplate:
 
 app = FastAPI(
     title="Crypto Gem Finder",
-    description="Sistema intelligente monitoraggio cryptocurrency",
-    version="2.0.1"
+    description="Sistema intelligente monitoraggio cryptocurrency con database",
+    version="2.1.0"
 )
 
 app.add_middleware(
@@ -287,8 +508,9 @@ alert_history: List[Dict] = []
 COINGECKO_BASE_URL = "https://api.coingecko.com/api/v3"
 TRACKED_COINS = ["bitcoin", "ethereum", "binancecoin", "cardano", "solana"]
 
-# Alert optimizer instance
+# Instances
 alert_optimizer = AlertOptimizer()
+db = DatabaseManager()
 
 
 class TelegramBot:
@@ -395,6 +617,9 @@ async def check_and_alert(coin_id: str):
     if not coin_data:
         return
     
+    # Salva prezzo su database
+    await db.save_price(coin_data)
+    
     price_cache[coin_id] = {**coin_data, 'timestamp': time.time()}
     
     alert_type, priority, should_check = analyze_crypto(coin_data)
@@ -417,6 +642,20 @@ async def check_and_alert(coin_id: str):
     
     if telegram_bot.send_message(message):
         alert_optimizer.record_alert(coin_id, alert_type, coin_data['price'], priority)
+        
+        # Salva alert su database
+        alert_data = {
+            'coin_id': coin_id,
+            'alert_type': alert_type.value,
+            'priority': priority.value,
+            'price': coin_data['price'],
+            'change_percent': coin_data.get('change24h', 0),
+            'volume_24h': coin_data.get('volume24h', 0),
+            'market_cap': coin_data.get('marketCap', 0),
+            'message': message
+        }
+        await db.save_alert(alert_data)
+        
         alert_history.append({
             'coin_id': coin_id,
             'alert_type': alert_type.value,
@@ -461,7 +700,7 @@ async def monitoring_loop():
 
 
 async def start_monitoring_internal():
-    """Avvia monitoring interno (chiamato da startup)"""
+    """Avvia monitoring interno"""
     global monitoring_active, monitoring_task
     
     if monitoring_active:
@@ -480,10 +719,12 @@ async def start_monitoring_internal():
 async def health_check():
     return {
         "status": "healthy",
-        "version": "2.0.1",
+        "version": "2.1.0",
         "monitoring_active": monitoring_active,
         "auto_start_enabled": AUTO_START_MONITORING,
         "telegram_configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
+        "database_configured": db.enabled,
+        "database_connected": db.connected,
         "tracked_coins": len(TRACKED_COINS),
         "cache_size": len(price_cache),
         "alert_history_size": len(alert_history),
@@ -500,14 +741,57 @@ async def get_prices():
     }
 
 
-@app.get("/api/alerts/history")
-async def get_alert_history_api(limit: int = 50):
-    return {"alerts": alert_history[-limit:], "total": len(alert_history)}
-
-
 @app.get("/api/alerts/stats")
 async def get_alert_stats():
     return alert_optimizer.get_stats()
+
+
+@app.get("/api/alerts/history")
+async def get_alert_history_api(limit: int = Query(default=50, le=200)):
+    """Storico alert - in-memory o database"""
+    if db.connected:
+        db_alerts = await db.get_alert_history(limit=limit)
+        if db_alerts:
+            return {"alerts": db_alerts, "total": len(db_alerts), "source": "database"}
+    
+    return {"alerts": alert_history[-limit:], "total": len(alert_history), "source": "memory"}
+
+
+@app.get("/api/history/prices")
+async def get_price_history_api(
+    coin: str = Query(..., description="Coin ID (es: bitcoin)"),
+    days: int = Query(default=7, le=30, description="Giorni di storico")
+):
+    """Storico prezzi da database"""
+    if not db.connected:
+        raise HTTPException(status_code=503, detail="Database non disponibile")
+    
+    history = await db.get_price_history(coin_id=coin, days=days)
+    
+    return {
+        "coin_id": coin,
+        "days": days,
+        "data_points": len(history),
+        "history": history
+    }
+
+
+@app.get("/api/history/alerts")
+async def get_alert_history_db(
+    limit: int = Query(default=100, le=500),
+    coin: Optional[str] = Query(default=None, description="Filtra per coin")
+):
+    """Storico alert completo da database"""
+    if not db.connected:
+        raise HTTPException(status_code=503, detail="Database non disponibile")
+    
+    alerts = await db.get_alert_history(limit=limit, coin_id=coin)
+    
+    return {
+        "total": len(alerts),
+        "coin_filter": coin,
+        "alerts": alerts
+    }
 
 
 @app.post("/api/test-telegram")
@@ -516,9 +800,9 @@ async def test_telegram():
         raise HTTPException(status_code=400, detail="Telegram non configurato")
     
     message = (
-        "🧪 <b>Test Crypto Gem Finder v2.0.1</b>\n\n"
+        "🧪 <b>Test Crypto Gem Finder v2.1</b>\n\n"
         "✅ Bot Telegram operativo\n"
-        "✅ AUTO-START attivo\n"
+        "✅ Database persistence attivo\n"
         "🔔 Sistema alert attivo\n"
         f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
@@ -533,13 +817,7 @@ async def test_telegram():
 
 @app.post("/api/start-monitoring")
 async def start_monitoring():
-    global monitoring_active, monitoring_task
-    
-    if monitoring_active:
-        return {"status": "already_running"}
-    
     await start_monitoring_internal()
-    
     return {"status": "started", "tracked_coins": TRACKED_COINS}
 
 
@@ -571,15 +849,23 @@ async def reset_alert_stats():
 @app.on_event("startup")
 async def startup_event():
     logger.info("=" * 60)
-    logger.info("🚀 CRYPTO GEM FINDER v2.0.1 - AVVIO")
+    logger.info("🚀 CRYPTO GEM FINDER v2.1 - AVVIO")
     logger.info("=" * 60)
     logger.info(f"Telegram: {bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)}")
     logger.info(f"CoinGecko API: {bool(COINGECKO_API_KEY)}")
     logger.info(f"Crypto monitorate: {len(TRACKED_COINS)}")
     logger.info(f"Auto-start: {AUTO_START_MONITORING}")
+    
+    # Connessione database
+    await db.connect()
+    if db.connected:
+        logger.info("💾 Database persistence: ATTIVO")
+    else:
+        logger.info("💾 Database persistence: DISABILITATO (in-memory mode)")
+    
     logger.info("=" * 60)
     
-    # AUTO-START monitoring se abilitato
+    # AUTO-START monitoring
     if AUTO_START_MONITORING:
         await start_monitoring_internal()
 
@@ -593,6 +879,7 @@ async def shutdown_event():
         if monitoring_task:
             monitoring_task.cancel()
     
+    await db.disconnect()
     logger.info("👋 Shutdown")
 
 
