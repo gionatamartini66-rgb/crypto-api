@@ -1,5 +1,5 @@
 """
-Crypto Gem Finder - Main Application v2.1
+Crypto Gem Finder - Main Application v2.2
 Sistema completo con Alert Optimizer + Database PostgreSQL
 """
 import os
@@ -17,6 +17,13 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import asyncpg
 
+# Whale Tracking (v2.2)
+try:
+    from whale_tracker import WhaleAlertAPI, WhaleTracker
+    WHALE_ENABLED = True
+except ImportError:
+    WHALE_ENABLED = False
+    logger.warning("⚠️ whale_tracker.py non trovato - whale tracking disabilitato")
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -121,7 +128,47 @@ class DatabaseManager:
                     CREATE INDEX IF NOT EXISTS idx_alerts_sent 
                     ON alerts_history(sent_at DESC)
                 """)
+
+# Whale transactions table (v2.2)
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS whale_transactions (
+                        id SERIAL PRIMARY KEY,
+                        transaction_hash VARCHAR(100) NOT NULL,
+                        blockchain VARCHAR(20) NOT NULL,
+                        symbol VARCHAR(10) NOT NULL,
+                        amount DECIMAL(30,8) NOT NULL,
+                        amount_usd BIGINT NOT NULL,
+                        from_owner VARCHAR(50),
+                        to_owner VARCHAR(50),
+                        transaction_type VARCHAR(20) DEFAULT 'transfer',
+                        whale_size VARCHAR(20) NOT NULL,
+                        timestamp BIGINT NOT NULL,
+                        detected_at TIMESTAMP DEFAULT NOW(),
+                        UNIQUE(blockchain, transaction_hash)
+                    )
+                """)
                 
+                await conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_whale_detected 
+                    ON whale_transactions(detected_at DESC)
+                """)
+
+                # Whale transactions table (v2.2)
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS whale_transactions (
+                        id SERIAL PRIMARY KEY,
+                        transaction_hash VARCHAR(100) NOT NULL,
+                        whale_size VARCHAR(20) NOT NULL,
+                        timestamp BIGINT NOT NULL,
+                        detected_at TIMESTAMP DEFAULT NOW(),
+                        UNIQUE(blockchain, transaction_hash)
+                    )
+                """)
+                
+                await conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_whale_detected 
+                    ON whale_transactions(detected_at DESC)
+                """)
                 logger.info("✅ Database schema verificato/creato")
                 
         except Exception as e:
@@ -182,7 +229,58 @@ class DatabaseManager:
                 )
         except Exception as e:
             logger.error(f"Error save_alert: {e}")
+
+    async def save_whale_transaction(self, whale_data: Dict):
+        """Salva whale transaction"""
+        if not self.connected or not self.pool:
+            return
+        
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO whale_transactions 
+                    (transaction_hash, blockchain, symbol, amount, amount_usd, 
+                     from_owner, to_owner, transaction_type, whale_size, timestamp)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                    ON CONFLICT (blockchain, transaction_hash) DO NOTHING
+                    """,
+                    whale_data['transaction_hash'],
+                    whale_data['blockchain'],
+                    whale_data['symbol'],
+                    float(whale_data['amount']),
+                    int(whale_data['amount_usd']),
+                    whale_data.get('from_owner', 'unknown'),
+                    whale_data.get('to_owner', 'unknown'),
+                    whale_data.get('transaction_type', 'transfer'),
+                    whale_data['whale_size'],
+                    int(whale_data['timestamp'])
+                )
+        except Exception as e:
+            logger.error(f"Error save_whale: {e}")
     
+    async def get_whale_history(self, limit: int = 50):
+        """Recupera whale history"""
+        if not self.connected or not self.pool:
+            return []
+        
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT transaction_hash, blockchain, symbol, amount,
+                           amount_usd, from_owner, to_owner, whale_size,
+                           timestamp, detected_at
+                    FROM whale_transactions
+                    ORDER BY detected_at DESC
+                    LIMIT $1
+                    """,
+                    limit
+                )
+            return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error get_whale_history: {e}")
+            return []
     async def get_price_history(self, coin_id: str, days: int = 7):
         """Recupera storico prezzi"""
         if not self.connected or not self.pool:
@@ -512,6 +610,12 @@ TRACKED_COINS = ["bitcoin", "ethereum", "binancecoin", "cardano", "solana"]
 alert_optimizer = AlertOptimizer()
 db = DatabaseManager()
 
+# Whale Tracker (v2.2)
+if WHALE_ENABLED:
+    whale_api = WhaleAlertAPI()
+    whale_tracker = WhaleTracker(whale_api)
+else:
+    whale_tracker = None
 
 class TelegramBot:
     """Client Telegram Bot"""
@@ -690,6 +794,40 @@ async def monitoring_loop():
             logger.info(f"📊 Stats: {stats['alerts_sent']} sent, "
                        f"{stats['alerts_blocked_cooldown']} cooldown, "
                        f"{stats['alerts_blocked_filters']} filtered")
+
+# Check whale activity (v2.2)
+            if whale_tracker:
+                whale_txs = whale_tracker.check_whale_activity()
+                for whale_tx in whale_txs:
+                    # Salva su database
+                    whale_data = {
+                        'transaction_hash': whale_tx.transaction_hash,
+                        'blockchain': whale_tx.blockchain,
+                        'symbol': whale_tx.symbol,
+                        'amount': whale_tx.amount,
+                        'amount_usd': whale_tx.amount_usd,
+                        'from_owner': whale_tx.from_owner,
+                        'to_owner': whale_tx.to_owner,
+                        'transaction_type': whale_tx.transaction_type,
+                        'whale_size': whale_tx.whale_size.value,
+                        'timestamp': whale_tx.timestamp
+                    }
+                    await db.save_whale_transaction(whale_data)
+                    
+                    # Alert Telegram
+                    emoji = "🔴" if "MEGA" in whale_tx.whale_size.value else "🐋"
+                    message = (
+                        f"{emoji} <b>WHALE DETECTED</b>\n\n"
+                        f"💰 <b>${whale_tx.amount_usd:,.0f}</b>\n"
+                        f"📊 {whale_tx.amount:,.2f} {whale_tx.symbol}\n"
+                        f"⛓️ {whale_tx.blockchain.upper()}\n"
+                        f"📤 From: {whale_tx.from_owner}\n"
+                        f"📥 To: {whale_tx.to_owner}\n"
+                        f"⏰ {datetime.fromtimestamp(whale_tx.timestamp).strftime('%H:%M:%S')}"
+                    )
+                    
+                    if telegram_bot.send_message(message):
+                        logger.info(f"🐋 Whale alert: {whale_tx.symbol} ${whale_tx.amount_usd:,.0f}")
             
             await asyncio.sleep(check_interval)
         except Exception as e:
@@ -719,12 +857,13 @@ async def start_monitoring_internal():
 async def health_check():
     return {
         "status": "healthy",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "monitoring_active": monitoring_active,
         "auto_start_enabled": AUTO_START_MONITORING,
         "telegram_configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
         "database_configured": db.enabled,
         "database_connected": db.connected,
+        "whale_tracking_enabled": WHALE_ENABLED,
         "tracked_coins": len(TRACKED_COINS),
         "cache_size": len(price_cache),
         "alert_history_size": len(alert_history),
@@ -845,11 +984,28 @@ async def reset_alert_stats():
     alert_optimizer.reset_stats()
     return {"status": "success"}
 
+@app.get("/api/whales/recent")
+async def get_recent_whales(limit: int = Query(default=20, le=100)):
+    """Ultimi movimenti whale"""
+    if not db.connected:
+        raise HTTPException(status_code=503, detail="Database non disponibile")
+    
+    whales = await db.get_whale_history(limit=limit)
+    
+    whale_stats = {}
+    if whale_tracker:
+        whale_stats = whale_tracker.get_stats()
+    
+    return {
+        "whales": whales,
+        "total": len(whales),
+        "tracker_stats": whale_stats
+    }
 
 @app.on_event("startup")
 async def startup_event():
     logger.info("=" * 60)
-    logger.info("🚀 CRYPTO GEM FINDER v2.1 - AVVIO")
+    logger.info("🚀 CRYPTO GEM FINDER v2.2 - AVVIO (Whale Tracking)")
     logger.info("=" * 60)
     logger.info(f"Telegram: {bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)}")
     logger.info(f"CoinGecko API: {bool(COINGECKO_API_KEY)}")
