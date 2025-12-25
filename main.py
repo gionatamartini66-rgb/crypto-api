@@ -1,6 +1,6 @@
 """
-Crypto Gem Finder - Main Application v2.0
-Sistema completo con Alert Optimizer integrato
+Crypto Gem Finder - Main Application v2.0.1
+Sistema completo con Alert Optimizer + AUTO-START
 """
 import os
 import time
@@ -125,17 +125,14 @@ class AlertOptimizer:
         self._track_rate_limit()
     
     def _check_rate_limit(self):
-        """Verifica rate limiting"""
         now = time.time()
         self.alerts_sent_minute = [t for t in self.alerts_sent_minute if now - t < 60]
         return len(self.alerts_sent_minute) < self.max_alerts_per_minute
     
     def _track_rate_limit(self):
-        """Traccia alert per rate limiting"""
         self.alerts_sent_minute.append(time.time())
     
     def _check_filters(self, crypto_data: Dict):
-        """Applica filtri qualità"""
         volume = crypto_data.get('volume24h', 0)
         if volume < self.min_volume_24h:
             return False, f"Volume basso"
@@ -151,7 +148,6 @@ class AlertOptimizer:
         return True, None
     
     def get_priority(self, alert_type: AlertType, crypto_data: Dict):
-        """Determina priorità alert"""
         change_24h = abs(crypto_data.get('change24h', 0))
         market_cap = crypto_data.get('marketCap', 0)
         
@@ -176,7 +172,6 @@ class AlertOptimizer:
         return AlertPriority.LOW
     
     def cleanup_old_alerts(self, max_age_hours: int = 24):
-        """Rimuove alert vecchi"""
         cutoff_time = time.time() - (max_age_hours * 3600)
         self.alert_history = {
             k: v for k, v in self.alert_history.items()
@@ -184,7 +179,6 @@ class AlertOptimizer:
         }
     
     def get_stats(self):
-        """Statistiche sistema"""
         return {
             **self.stats,
             "active_cooldowns": len(self.alert_history),
@@ -195,7 +189,6 @@ class AlertOptimizer:
         }
     
     def reset_stats(self):
-        """Reset statistiche"""
         self.stats = {
             "total_checks": 0,
             "alerts_sent": 0,
@@ -210,7 +203,6 @@ class MessageTemplate:
     
     @staticmethod
     def format_alert(alert_type: AlertType, priority: AlertPriority, crypto_data: Dict):
-        """Formatta messaggio alert"""
         name = crypto_data['name']
         symbol = crypto_data['symbol']
         price = crypto_data['price']
@@ -268,7 +260,7 @@ class MessageTemplate:
 app = FastAPI(
     title="Crypto Gem Finder",
     description="Sistema intelligente monitoraggio cryptocurrency",
-    version="2.0.0"
+    version="2.0.1"
 )
 
 app.add_middleware(
@@ -283,6 +275,7 @@ app.add_middleware(
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY", "")
+AUTO_START_MONITORING = os.getenv("AUTO_START_MONITORING", "true").lower() == "true"
 
 # State
 monitoring_active = False
@@ -307,7 +300,6 @@ class TelegramBot:
         self.base_url = f"https://api.telegram.org/bot{token}"
     
     def send_message(self, text: str):
-        """Invia messaggio Telegram"""
         if not self.token or not self.chat_id:
             logger.warning("Telegram non configurato")
             return False
@@ -332,7 +324,6 @@ telegram_bot = TelegramBot(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 
 
 def get_coingecko_headers():
-    """Headers CoinGecko"""
     headers = {"accept": "application/json"}
     if COINGECKO_API_KEY:
         headers["x-cg-pro-api-key"] = COINGECKO_API_KEY
@@ -340,7 +331,6 @@ def get_coingecko_headers():
 
 
 async def fetch_coin_data(coin_id: str):
-    """Recupera dati coin"""
     try:
         url = f"{COINGECKO_BASE_URL}/coins/{coin_id}"
         params = {
@@ -377,7 +367,6 @@ async def fetch_coin_data(coin_id: str):
 
 
 def analyze_crypto(coin_data: Dict):
-    """Analizza crypto"""
     change_24h = coin_data.get('change24h', 0)
     volume = coin_data.get('volume24h', 0)
     market_cap = coin_data.get('marketCap', 0)
@@ -402,7 +391,6 @@ def analyze_crypto(coin_data: Dict):
 
 
 async def check_and_alert(coin_id: str):
-    """Controlla coin e invia alert"""
     coin_data = await fetch_coin_data(coin_id)
     if not coin_data:
         return
@@ -440,7 +428,6 @@ async def check_and_alert(coin_id: str):
 
 
 async def monitoring_loop():
-    """Loop monitoring"""
     logger.info("🚀 Monitoring loop avviato")
     
     check_interval = 300
@@ -473,16 +460,29 @@ async def monitoring_loop():
     logger.info("⏸️ Monitoring fermato")
 
 
+async def start_monitoring_internal():
+    """Avvia monitoring interno (chiamato da startup)"""
+    global monitoring_active, monitoring_task
+    
+    if monitoring_active:
+        return
+    
+    monitoring_active = True
+    monitoring_task = asyncio.create_task(monitoring_loop())
+    logger.info("▶️ Monitoring AUTO-STARTED")
+
+
 # ============================================================================
 # API ENDPOINTS
 # ============================================================================
 
 @app.get("/api/health")
 async def health_check():
-    """Health check"""
     return {
         "status": "healthy",
+        "version": "2.0.1",
         "monitoring_active": monitoring_active,
+        "auto_start_enabled": AUTO_START_MONITORING,
         "telegram_configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
         "tracked_coins": len(TRACKED_COINS),
         "cache_size": len(price_cache),
@@ -493,7 +493,6 @@ async def health_check():
 
 @app.get("/api/prices")
 async def get_prices():
-    """Prezzi attuali"""
     return {
         "prices": price_cache,
         "count": len(price_cache),
@@ -502,26 +501,24 @@ async def get_prices():
 
 
 @app.get("/api/alerts/history")
-async def get_alert_history(limit: int = 50):
-    """Storico alert"""
+async def get_alert_history_api(limit: int = 50):
     return {"alerts": alert_history[-limit:], "total": len(alert_history)}
 
 
 @app.get("/api/alerts/stats")
 async def get_alert_stats():
-    """Statistiche alert"""
     return alert_optimizer.get_stats()
 
 
 @app.post("/api/test-telegram")
 async def test_telegram():
-    """Test Telegram"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         raise HTTPException(status_code=400, detail="Telegram non configurato")
     
     message = (
-        "🧪 <b>Test Crypto Gem Finder v2.0</b>\n\n"
+        "🧪 <b>Test Crypto Gem Finder v2.0.1</b>\n\n"
         "✅ Bot Telegram operativo\n"
+        "✅ AUTO-START attivo\n"
         "🔔 Sistema alert attivo\n"
         f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
@@ -536,22 +533,18 @@ async def test_telegram():
 
 @app.post("/api/start-monitoring")
 async def start_monitoring():
-    """Avvia monitoring"""
     global monitoring_active, monitoring_task
     
     if monitoring_active:
         return {"status": "already_running"}
     
-    monitoring_active = True
-    monitoring_task = asyncio.create_task(monitoring_loop())
-    logger.info("▶️ Monitoring avviato")
+    await start_monitoring_internal()
     
     return {"status": "started", "tracked_coins": TRACKED_COINS}
 
 
 @app.post("/api/stop-monitoring")
 async def stop_monitoring():
-    """Ferma monitoring"""
     global monitoring_active, monitoring_task
     
     if not monitoring_active:
@@ -571,26 +564,28 @@ async def stop_monitoring():
 
 @app.post("/api/alerts/reset-stats")
 async def reset_alert_stats():
-    """Reset statistiche"""
     alert_optimizer.reset_stats()
     return {"status": "success"}
 
 
 @app.on_event("startup")
 async def startup_event():
-    """Startup"""
     logger.info("=" * 60)
-    logger.info("🚀 CRYPTO GEM FINDER v2.0 - AVVIO")
+    logger.info("🚀 CRYPTO GEM FINDER v2.0.1 - AVVIO")
     logger.info("=" * 60)
     logger.info(f"Telegram: {bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)}")
     logger.info(f"CoinGecko API: {bool(COINGECKO_API_KEY)}")
     logger.info(f"Crypto monitorate: {len(TRACKED_COINS)}")
+    logger.info(f"Auto-start: {AUTO_START_MONITORING}")
     logger.info("=" * 60)
+    
+    # AUTO-START monitoring se abilitato
+    if AUTO_START_MONITORING:
+        await start_monitoring_internal()
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Shutdown"""
     global monitoring_active, monitoring_task
     
     if monitoring_active:
