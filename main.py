@@ -129,8 +129,8 @@ class DatabaseManager:
                     CREATE INDEX IF NOT EXISTS idx_alerts_sent 
                     ON alerts_history(sent_at DESC)
                 """)
-
-# Whale transactions table (v2.2)
+                
+                # Whale transactions table (v2.2)
                 await conn.execute("""
                     CREATE TABLE IF NOT EXISTS whale_transactions (
                         id SERIAL PRIMARY KEY,
@@ -153,23 +153,8 @@ class DatabaseManager:
                     CREATE INDEX IF NOT EXISTS idx_whale_detected 
                     ON whale_transactions(detected_at DESC)
                 """)
-
-                # Whale transactions table (v2.2)
-                await conn.execute("""
-                    CREATE TABLE IF NOT EXISTS whale_transactions (
-                        id SERIAL PRIMARY KEY,
-                        transaction_hash VARCHAR(100) NOT NULL,
-                        whale_size VARCHAR(20) NOT NULL,
-                        timestamp BIGINT NOT NULL,
-                        detected_at TIMESTAMP DEFAULT NOW(),
-                        UNIQUE(blockchain, transaction_hash)
-                    )
-                """)
                 
-                await conn.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_whale_detected 
-                    ON whale_transactions(detected_at DESC)
-                """)
+             
                 logger.info("✅ Database schema verificato/creato")
                 
         except Exception as e:
