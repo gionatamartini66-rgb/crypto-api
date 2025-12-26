@@ -17,6 +17,13 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import asyncpg
 
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 # Whale Tracking (v2.2)
 try:
     from whale_tracker import WhaleAlertAPI, WhaleTracker
@@ -24,12 +31,6 @@ try:
 except ImportError:
     WHALE_ENABLED = False
     logger.warning("⚠️ whale_tracker.py non trovato - whale tracking disabilitato")
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
 
 
 # ============================================================================
